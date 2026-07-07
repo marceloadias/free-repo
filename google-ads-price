@@ -1,0 +1,258 @@
+# Script: Alerta de Saldo Baixo — Google Ads Scripts
+ 
+## 1. Objetivo
+ 
+Monitorar automaticamente o saldo/orçamento de uma conta do Google Ads e enviar um
+e-mail de alerta quando o saldo estimado atingir um limite mínimo definido pelo usuário.
+Elimina a necessidade de entrar manualmente na conta para conferir se ela está prestes
+a ficar sem saldo (o que pararia as campanhas ativas).
+ 
+- **Nome do script:** Saldo baixo
+- **Arquivo:** Code.gs
+- **Plataforma:** Google Ads Scripts (Apps Script)
+- **Execução recomendada:** agendada (1x por dia, via relógio de agendamento em *Scripts*)
+---
+ 
+## 2. Duas versões do script
+ 
+Existem dois cenários possíveis, dependendo do tipo de faturamento da conta:
+ 
+| Cenário | Método usado | Quando se aplica |
+|---|---|---|
+| **A — Conta com Ordem de Orçamento (Budget Order)** | `AdsApp.budgetOrders()` | Contas com faturamento consolidado/pós-pago, comum em agências e grandes anunciantes |
+| **B — Conta pré-paga (cartão de crédito)** | `AdsApp.currentAccount().getStatsFor()` + valor de investimento controlado manualmente | Maioria das contas de clientes pequenos/PMEs |
+ 
+> ⚠️ Importante: `AdsApp.budgetOrders()` **só retorna resultados em contas com ordem de
+> orçamento cadastrada**. Se a conta for pré-paga comum, o script sempre cairá no bloco
+> de "não encontrei orçamento ativo". Por isso, use a **Versão B** para a maioria dos casos.
+ 
+---
+ 
+## 3. Versão A — Com Budget Order
+ 
+```javascript
+var EMAIL = "seuemail@gmail.com";
+var LIMITE_ALERTA = 2000;
+var ENVIAR_ALERTA_TODO_DIA = false;
+ 
+function main() {
+  var account = AdsApp.currentAccount();
+  var currency = account.getCurrencyCode();
+ 
+  var orders = AdsApp.budgetOrders()
+    .withCondition("Status = ACTIVE")
+    .get();
+ 
+  if (!orders.hasNext()) {
+    MailApp.sendEmail(
+      EMAIL,
+      "[Google Ads] Nao encontrei orcamento ativo",
+      "Conta: " + account.getName() + "\n" +
+      "ID: " + account.getCustomerId() + "\n\n" +
+      "Nao encontrei uma ordem de orcamento ativa nesta conta."
+    );
+    return;
+  }
+ 
+  var order = orders.next();
+  var spendingLimit = order.getSpendingLimit();
+ 
+  if (spendingLimit === null) {
+    Logger.log("A ordem de orcamento ativa nao tem limite de gastos.");
+    return;
+  }
+ 
+  var start = order.getStartDateTime();
+  var startDate = toYyyyMmDd(start);
+ 
+  var today = Utilities.formatDate(
+    new Date(),
+    account.getTimeZone(),
+    "yyyyMMdd"
+  );
+ 
+  var cost = account.getStatsFor(startDate, today).getCost();
+ 
+  var saldoCalculado = spendingLimit - cost;
+  var saldoNaConta = Math.max(0, saldoCalculado);
+  var excessoEstimado = Math.max(0, cost - spendingLimit);
+ 
+  Logger.log("Conta: " + account.getName());
+  Logger.log("Saldo estimado: " + formatMoney(saldoNaConta, currency));
+  Logger.log("Gasto no periodo: " + formatMoney(cost, currency));
+  Logger.log("Limite de orcamento: " + formatMoney(spendingLimit, currency));
+ 
+  var precisaAlertar = saldoNaConta <= LIMITE_ALERTA;
+ 
+  if (!precisaAlertar && !ENVIAR_ALERTA_TODO_DIA) {
+    Logger.log("Saldo acima do limite de alerta. Nada a fazer.");
+    return;
+  }
+ 
+  var props = PropertiesService.getScriptProperties();
+  var chave = "ultimoAlerta_" + account.getCustomerId();
+  var ultimoEnviado = props.getProperty(chave);
+ 
+  if (!ENVIAR_ALERTA_TODO_DIA && ultimoEnviado === today) {
+    Logger.log("Alerta ja enviado hoje. Ignorando.");
+    return;
+  }
+ 
+  var assunto = precisaAlertar
+    ? "[Google Ads] Saldo baixo - " + account.getName()
+    : "[Google Ads] Status diario de saldo - " + account.getName();
+ 
+  var corpo =
+    "Conta: " + account.getName() + "\n" +
+    "ID: " + account.getCustomerId() + "\n\n" +
+    "Limite de orcamento: " + formatMoney(spendingLimit, currency) + "\n" +
+    "Gasto no periodo: " + formatMoney(cost, currency) + "\n" +
+    "Saldo estimado: " + formatMoney(saldoNaConta, currency) + "\n" +
+    (excessoEstimado > 0
+      ? "\nAtencao: o gasto ja ultrapassou o limite em " + formatMoney(excessoEstimado, currency) + "\n"
+      : "\n") +
+    (precisaAlertar
+      ? "O saldo esta abaixo do limite de alerta configurado (" + formatMoney(LIMITE_ALERTA, currency) + ")."
+      : "Alerta diario ativado - segue o status atual da conta.");
+ 
+  MailApp.sendEmail(EMAIL, assunto, corpo);
+  props.setProperty(chave, today);
+ 
+  Logger.log("E-mail enviado para " + EMAIL);
+}
+ 
+// A API do Google Ads Scripts retorna a data de inicio da ordem
+// como um objeto {year, month, day, ...}, nao um Date do JS
+function toYyyyMmDd(dateTimeObj) {
+  var mm = ("0" + dateTimeObj.month).slice(-2);
+  var dd = ("0" + dateTimeObj.day).slice(-2);
+  return "" + dateTimeObj.year + mm + dd;
+}
+ 
+function formatMoney(value, currency) {
+  return currency + " " + value.toFixed(2).replace(".", ",");
+}
+```
+ 
+---
+ 
+## 4. Versão B — Sem Budget Order (contas pré-pagas / cartão de crédito)
+ 
+Usa um valor de **investimento total planejado** definido manualmente, e calcula o
+saldo com base no gasto acumulado desde uma data de referência (ex: início do mês
+ou início da campanha).
+ 
+```javascript
+var EMAIL = "seuemail@gmail.com";
+var LIMITE_ALERTA = 200;               // valor mínimo de saldo antes de alertar
+var INVESTIMENTO_TOTAL = 3000;         // valor total que o cliente pretende investir no periodo
+var DATA_INICIO = "20260701";          // formato yyyyMMdd - inicio do periodo de referencia
+var ENVIAR_ALERTA_TODO_DIA = false;
+ 
+function main() {
+  var account = AdsApp.currentAccount();
+  var currency = account.getCurrencyCode();
+ 
+  var today = Utilities.formatDate(
+    new Date(),
+    account.getTimeZone(),
+    "yyyyMMdd"
+  );
+ 
+  var cost = account.getStatsFor(DATA_INICIO, today).getCost();
+ 
+  var saldoCalculado = INVESTIMENTO_TOTAL - cost;
+  var saldoEstimado = Math.max(0, saldoCalculado);
+  var excessoEstimado = Math.max(0, cost - INVESTIMENTO_TOTAL);
+ 
+  Logger.log("Conta: " + account.getName());
+  Logger.log("Investimento total: " + formatMoney(INVESTIMENTO_TOTAL, currency));
+  Logger.log("Gasto no periodo: " + formatMoney(cost, currency));
+  Logger.log("Saldo estimado: " + formatMoney(saldoEstimado, currency));
+ 
+  var precisaAlertar = saldoEstimado <= LIMITE_ALERTA;
+ 
+  if (!precisaAlertar && !ENVIAR_ALERTA_TODO_DIA) {
+    Logger.log("Saldo acima do limite de alerta. Nada a fazer.");
+    return;
+  }
+ 
+  var props = PropertiesService.getScriptProperties();
+  var chave = "ultimoAlerta_" + account.getCustomerId();
+  var ultimoEnviado = props.getProperty(chave);
+ 
+  if (!ENVIAR_ALERTA_TODO_DIA && ultimoEnviado === today) {
+    Logger.log("Alerta ja enviado hoje. Ignorando.");
+    return;
+  }
+ 
+  var assunto = precisaAlertar
+    ? "[Google Ads] Saldo baixo - " + account.getName()
+    : "[Google Ads] Status diario de saldo - " + account.getName();
+ 
+  var corpo =
+    "Conta: " + account.getName() + "\n" +
+    "ID: " + account.getCustomerId() + "\n\n" +
+    "Investimento total planejado: " + formatMoney(INVESTIMENTO_TOTAL, currency) + "\n" +
+    "Gasto no periodo (desde " + DATA_INICIO + "): " + formatMoney(cost, currency) + "\n" +
+    "Saldo estimado: " + formatMoney(saldoEstimado, currency) + "\n" +
+    (excessoEstimado > 0
+      ? "\nAtencao: o gasto ja ultrapassou o valor planejado em " + formatMoney(excessoEstimado, currency) + "\n"
+      : "\n") +
+    (precisaAlertar
+      ? "O saldo esta abaixo do limite de alerta configurado (" + formatMoney(LIMITE_ALERTA, currency) + ")."
+      : "Alerta diario ativado - segue o status atual da conta.");
+ 
+  MailApp.sendEmail(EMAIL, assunto, corpo);
+  props.setProperty(chave, today);
+ 
+  Logger.log("E-mail enviado para " + EMAIL);
+}
+ 
+function formatMoney(value, currency) {
+  return currency + " " + value.toFixed(2).replace(".", ",");
+}
+```
+ 
+> Nesta versão, `INVESTIMENTO_TOTAL` e `DATA_INICIO` substituem a ordem de orçamento.
+> É preciso atualizar esses valores manualmente sempre que o cliente definir um novo
+> ciclo/valor de investimento (ex: todo início de mês).
+ 
+---
+ 
+## 5. Variáveis de configuração
+ 
+| Variável | Descrição | Onde aparece |
+|---|---|---|
+| `EMAIL` | E-mail que receberá o alerta | A e B |
+| `LIMITE_ALERTA` | Valor de saldo abaixo do qual o alerta é disparado | A e B |
+| `ENVIAR_ALERTA_TODO_DIA` | Se `true`, envia um e-mail de status diário mesmo com saldo ok | A e B |
+| `INVESTIMENTO_TOTAL` | Valor total que a conta pretende investir no período | Somente B |
+| `DATA_INICIO` | Data de referência (yyyyMMdd) para começar a contar o gasto | Somente B |
+ 
+---
+ 
+## 6. Lógica de controle de envio (anti-spam de alerta)
+ 
+Ambas as versões usam `PropertiesService.getScriptProperties()` para gravar a data do
+último alerta enviado por conta (`ultimoAlerta_<customerId>`). Isso evita que o script
+dispare o mesmo alerta várias vezes no mesmo dia, especialmente se for agendado para
+rodar de hora em hora.
+ 
+---
+ 
+## 7. Como agendar
+ 
+1. Abrir o script em **Scripts** dentro do Google Ads.
+2. Clicar no ícone de relógio (agendamento).
+3. Definir frequência — recomendado: **diariamente**, no início da manhã.
+4. Salvar.
+---
+ 
+## 8. Possíveis evoluções futuras (fora de escopo desta versão)
+ 
+- Rodar em múltiplas contas via **MCC (Manager Account) scripts**, consolidando o
+  alerta de várias contas em um único e-mail.
+- Enviar alerta também via WhatsApp/Slack (webhook) além de e-mail.
+- Guardar histórico de saldo em uma planilha do Google Sheets para acompanhamento.
+- Alertas escalonados (ex: 50%, 20%, 5% do orçamento restante).
