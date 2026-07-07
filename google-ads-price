@@ -256,3 +256,9 @@ rodar de hora em hora.
 - Enviar alerta também via WhatsApp/Slack (webhook) além de e-mail.
 - Guardar histórico de saldo em uma planilha do Google Sheets para acompanhamento.
 - Alertas escalonados (ex: 50%, 20%, 5% do orçamento restante).
+
+Link Google Script
+https://developers.google.com/google-ads/scripts/docs/start
+
+Vídeo Preview - Youtube
+https://www.youtube.com/watch?v=DUbjUw4egIU
